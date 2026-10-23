@@ -1,0 +1,70 @@
+﻿import torch
+import torch.nn as nn
+
+from common import ATOM_DIM, BOND_DIM
+from protein_encoder import ProteinEncoder
+from graph_transformer_3d import GraphTransformer3D
+from cross_attention import CrossAttention
+from smiles_encoder import SMILESEncoder, encode_smiles
+
+
+def mpool(x, mask):
+    mask = mask.to(x.dtype)
+    return (x * mask.unsqueeze(-1)).sum(1) / mask.sum(
+        1, keepdim=True
+    ).clamp(min=1)
+
+
+class MultimodalAffinityModel(nn.Module):
+    """3D graph, SMILES Transformer, protein and cross-attention."""
+
+    def __init__(self, d=128, h=4, layers=3, drop=0.1):
+        super().__init__()
+        self.cfg = dict(d=d, h=h, layers=layers, drop=drop)
+
+        self.drug = GraphTransformer3D(
+            ATOM_DIM, BOND_DIM, d, h, layers
+        )
+        self.smiles = SMILESEncoder(d=d, heads=h, dropout=drop)
+        self.prot = ProteinEncoder(d)
+
+        self.graph_cross = CrossAttention(d, h, drop)
+        self.smiles_cross = CrossAttention(d, h, drop)
+
+        self.head = nn.Sequential(
+            nn.Linear(5 * d, 2 * d),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(2 * d, d),
+            nn.GELU(),
+            nn.Linear(d, 1),
+        )
+
+    def forward(self, data):
+        dx, dm = self.drug(data)
+        px, pm = self.prot(data.prot)
+
+        # PyG batches string attributes as a list of SMILES strings.
+        smiles_list = data.smiles
+        if isinstance(smiles_list, str):
+            smiles_list = [smiles_list]
+
+        token_ids = torch.stack([
+            encode_smiles(s) for s in smiles_list
+        ]).to(dx.device)
+
+        sx, sm = self.smiles(token_ids)
+
+        graph_context, _ = self.graph_cross(dx, px, pm)
+        smiles_context, _ = self.smiles_cross(sx, px, pm)
+
+        features = torch.cat([
+            mpool(graph_context, dm),
+            mpool(smiles_context, sm),
+            mpool(dx, dm),
+            mpool(sx, sm),
+            mpool(px, pm),
+        ], dim=-1)
+
+        return self.head(features).squeeze(-1)
+
